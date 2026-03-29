@@ -1,178 +1,190 @@
-import numpy as np
 import random
-import copy
 
 # Constants
 EMPTY = 0
 BLACK = 1
 WHITE = 2
 
-# Directions: (dr, dc) for N, NE, E, SE, S, SW, W, NW
-DIRECTIONS = [(-1, 0), (-1, 1), (0, 1), (1, 1),
-              (1, 0), (1, -1), (0, -1), (-1, -1)]
+# Directions as flat offsets on a 10x10 padded board (sentinel-based)
+# We use a 10x10 board with SENTINEL=3 border to avoid bounds checking
+SENTINEL = 3
+BOARD_SIZE = 100  # 10x10
+
+# Direction offsets on 10-wide board
+DIR_OFFSETS = [-10, -9, 1, 11, 10, 9, -1, -11]  # N, NE, E, SE, S, SW, W, NW
+
+# Mapping (row, col) in 8x8 to index in 10x10
+def rc_to_idx(r, c):
+    return (r + 1) * 10 + (c + 1)
+
+def idx_to_rc(idx):
+    return (idx // 10 - 1, idx % 10 - 1)
+
+# All valid cell indices on the 10x10 board
+VALID_CELLS = [rc_to_idx(r, c) for r in range(8) for c in range(8)]
 
 # Zobrist hashing tables
-# zobrist[piece][row][col] — piece in {0=BLACK, 1=WHITE}
-zobrist = [[random.getrandbits(64) for _ in range(64)] for _ in range(2)]
-# zobrist_turn: XOR when it's White's turn
+# zobrist[piece][cell_index] — piece in {0=BLACK-1, 1=WHITE-1}
+zobrist = [[random.getrandbits(64) for _ in range(BOARD_SIZE)] for _ in range(2)]
 zobrist_turn = random.getrandbits(64)
 
 
 def move_code(move, color):
-    """Encode a move for AMAF/PPAF: color * 64 + row * 8 + col."""
+    """Encode a move for AMAF/PPAF: (color-1)*64 + row*8 + col."""
     return (color - 1) * 64 + move[0] * 8 + move[1]
 
 
 class Board:
+    __slots__ = ['cells', 'turn', 'rollout', 'pass_count', 'h']
+
     def __init__(self):
-        self.board = np.zeros((8, 8), dtype=np.int8)
+        # 10x10 padded board with sentinels
+        self.cells = [SENTINEL] * BOARD_SIZE
+        for idx in VALID_CELLS:
+            self.cells[idx] = EMPTY
         # Standard starting position
-        self.board[3][3] = WHITE
-        self.board[3][4] = BLACK
-        self.board[4][3] = BLACK
-        self.board[4][4] = WHITE
-        self.turn = BLACK  # Black plays first
-        self.rollout = []  # moves played (for PPAF)
-        self.pass_count = 0  # consecutive passes
-        # Compute initial Zobrist hash
+        self.cells[rc_to_idx(3, 3)] = WHITE
+        self.cells[rc_to_idx(3, 4)] = BLACK
+        self.cells[rc_to_idx(4, 3)] = BLACK
+        self.cells[rc_to_idx(4, 4)] = WHITE
+        self.turn = BLACK
+        self.rollout = []
+        self.pass_count = 0
         self.h = self._compute_hash()
 
     def _compute_hash(self):
         h = 0
-        for r in range(8):
-            for c in range(8):
-                p = self.board[r][c]
-                if p != EMPTY:
-                    h ^= zobrist[p - 1][r * 8 + c]
+        cells = self.cells
+        for idx in VALID_CELLS:
+            p = cells[idx]
+            if p == BLACK or p == WHITE:
+                h ^= zobrist[p - 1][idx]
         if self.turn == WHITE:
             h ^= zobrist_turn
         return h
 
     def copy(self):
         b = Board.__new__(Board)
-        b.board = self.board.copy()
+        b.cells = self.cells[:]
         b.turn = self.turn
         b.rollout = self.rollout[:]
         b.pass_count = self.pass_count
         b.h = self.h
         return b
 
-    def opponent(self):
-        return WHITE if self.turn == BLACK else BLACK
-
-    def _flips_in_dir(self, r, c, dr, dc, color):
-        """Return list of positions to flip in one direction."""
-        opp = WHITE if color == BLACK else BLACK
-        flips = []
-        r, c = r + dr, c + dc
-        while 0 <= r < 8 and 0 <= c < 8:
-            if self.board[r][c] == opp:
-                flips.append((r, c))
-            elif self.board[r][c] == color:
-                return flips
-            else:
-                return []
-            r, c = r + dr, c + dc
-        return []
-
-    def _get_flips(self, r, c, color):
-        """Return all positions flipped by placing color at (r, c)."""
-        if self.board[r][c] != EMPTY:
-            return []
-        all_flips = []
-        for dr, dc in DIRECTIONS:
-            all_flips.extend(self._flips_in_dir(r, c, dr, dc, color))
-        return all_flips
-
     def legalMoves(self):
         """Return list of legal (row, col) moves for current player."""
+        color = self.turn
+        opp = 3 - color  # BLACK=1->WHITE=2, WHITE=2->BLACK=1
+        cells = self.cells
         moves = []
-        for r in range(8):
-            for c in range(8):
-                if self.board[r][c] == EMPTY:
-                    if self._get_flips(r, c, self.turn):
-                        moves.append((r, c))
+        for idx in VALID_CELLS:
+            if cells[idx] != EMPTY:
+                continue
+            # Check each direction
+            for d in DIR_OFFSETS:
+                pos = idx + d
+                if cells[pos] != opp:
+                    continue
+                # Walk in this direction
+                pos += d
+                while cells[pos] == opp:
+                    pos += d
+                if cells[pos] == color:
+                    moves.append(idx_to_rc(idx))
+                    break
         return moves
 
     def play(self, move):
         """Play a move (row, col) or handle pass (None)."""
         if move is None:
-            # Pass
             self.pass_count += 1
-            self.h ^= zobrist_turn  # switch turn in hash
-            self.turn = self.opponent()
+            self.h ^= zobrist_turn
+            self.turn = 3 - self.turn
             return
 
         self.pass_count = 0
         r, c = move
+        idx = rc_to_idx(r, c)
         color = self.turn
-        opp = self.opponent()
-
-        # Get flips
-        flips = self._get_flips(r, c, color)
+        opp = 3 - color
+        cells = self.cells
 
         # Place stone
-        self.board[r][c] = color
-        self.h ^= zobrist[color - 1][r * 8 + c]
+        cells[idx] = color
+        h = self.h ^ zobrist[color - 1][idx]
 
-        # Flip captured stones
-        for fr, fc in flips:
-            self.board[fr][fc] = color
-            # XOR out old color, XOR in new color
-            self.h ^= zobrist[opp - 1][fr * 8 + fc]
-            self.h ^= zobrist[color - 1][fr * 8 + fc]
+        # Flip in each direction
+        for d in DIR_OFFSETS:
+            pos = idx + d
+            if cells[pos] != opp:
+                continue
+            # Collect flips
+            flips = []
+            while cells[pos] == opp:
+                flips.append(pos)
+                pos += d
+            if cells[pos] == color:
+                for f in flips:
+                    cells[f] = color
+                    h ^= zobrist[opp - 1][f] ^ zobrist[color - 1][f]
 
-        # Record move
-        self.rollout.append(move_code(move, color))
-
-        # Switch turn
-        self.h ^= zobrist_turn
+        # Record move and switch turn
+        self.rollout.append((color - 1) * 64 + r * 8 + c)
+        h ^= zobrist_turn
+        self.h = h
         self.turn = opp
 
     def terminal(self):
-        """Game is over if both players have passed consecutively."""
-        if self.pass_count >= 2:
-            return True
-        return False
+        return self.pass_count >= 2
 
     def score(self):
         """1.0 if Black wins, 0.0 if White wins, 0.5 if draw."""
-        black = np.count_nonzero(self.board == BLACK)
-        white = np.count_nonzero(self.board == WHITE)
+        black = 0
+        white = 0
+        cells = self.cells
+        for idx in VALID_CELLS:
+            p = cells[idx]
+            if p == BLACK:
+                black += 1
+            elif p == WHITE:
+                white += 1
         if black > white:
             return 1.0
         elif white > black:
             return 0.0
-        else:
-            return 0.5
+        return 0.5
 
     def playout(self):
         """Play random moves until terminal, return score."""
-        while not self.terminal():
+        while self.pass_count < 2:
             moves = self.legalMoves()
             if moves:
-                self.play(random.choice(moves))
+                self.play(moves[random.randrange(len(moves))])
             else:
-                self.play(None)
+                self.pass_count += 1
+                self.h ^= zobrist_turn
+                self.turn = 3 - self.turn
         return self.score()
 
     def playoutAMAF(self):
-        """Playout that records all moves played (for RAVE/GRAVE).
-        Returns (score, rollout_from_start_of_playout)."""
+        """Playout recording moves for RAVE/GRAVE. Returns (score, new_moves)."""
         start = len(self.rollout)
-        while not self.terminal():
+        while self.pass_count < 2:
             moves = self.legalMoves()
             if moves:
-                self.play(random.choice(moves))
+                self.play(moves[random.randrange(len(moves))])
             else:
-                self.play(None)
+                self.pass_count += 1
+                self.h ^= zobrist_turn
+                self.turn = 3 - self.turn
         return self.score(), self.rollout[start:]
 
     def __str__(self):
         symbols = {EMPTY: '.', BLACK: 'X', WHITE: 'O'}
         lines = ['  a b c d e f g h']
         for r in range(8):
-            row = ' '.join(symbols[self.board[r][c]] for c in range(8))
+            row = ' '.join(symbols[self.cells[rc_to_idx(r, c)]] for c in range(8))
             lines.append(f'{r + 1} {row}')
         lines.append(f'Turn: {"Black(X)" if self.turn == BLACK else "White(O)"}')
         return '\n'.join(lines)
@@ -181,6 +193,18 @@ class Board:
 # ---- Validation ----
 
 if __name__ == '__main__':
+    import time
+    print("Benchmarking playout speed...")
+    b = Board()
+    t0 = time.time()
+    N = 1000
+    for _ in range(N):
+        b2 = b.copy()
+        b2.playout()
+    t1 = time.time()
+    print(f"{N} playouts in {t1-t0:.2f}s = {N/(t1-t0):.0f} playouts/sec")
+    print()
+
     print("Running 10,000 random games...")
     total_moves = 0
     n_games = 10000
@@ -204,41 +228,10 @@ if __name__ == '__main__':
     print(f"Average game length: {avg_len:.1f} moves")
     print(f"Black wins: {scores[1.0]}, White wins: {scores[0.0]}, Draws: {scores[0.5]}")
     print(f"Black win rate: {scores[1.0] / n_games:.3f}")
-    print()
 
-    # Display a sample game step by step
-    print("=== Sample Game ===")
-    b = Board()
-    print(f"Initial board:\n{b}\n")
-    move_num = 0
-    while not b.terminal():
-        moves = b.legalMoves()
-        if moves:
-            m = random.choice(moves)
-            player = "Black" if b.turn == BLACK else "White"
-            move_num += 1
-            b.play(m)
-            if move_num <= 10 or b.terminal():
-                col_letter = chr(ord('a') + m[1])
-                print(f"Move {move_num}: {player} plays {col_letter}{m[0]+1}")
-                print(b)
-                print()
-        else:
-            player = "Black" if b.turn == BLACK else "White"
-            print(f"{player} passes")
-            b.play(None)
-
-    if move_num > 10:
-        print(f"... (showing first 10 and last move, total {move_num} moves)")
-
-    print(f"\nFinal score: Black={np.count_nonzero(b.board == BLACK)}, "
-          f"White={np.count_nonzero(b.board == WHITE)}")
-    result = "Black wins" if b.score() == 1.0 else "White wins" if b.score() == 0.0 else "Draw"
-    print(f"Result: {result}")
-
-    # Verify Zobrist hash consistency
-    print("\n=== Zobrist Hash Consistency Check ===")
-    consistent = True
+    # Zobrist hash consistency
+    print("\nZobrist hash consistency...", end=" ")
+    ok = True
     for _ in range(100):
         b = Board()
         while not b.terminal():
@@ -248,8 +241,8 @@ if __name__ == '__main__':
             else:
                 b.play(None)
             if b.h != b._compute_hash():
-                consistent = False
+                ok = False
                 break
-        if not consistent:
+        if not ok:
             break
-    print(f"Hash consistency: {'PASS' if consistent else 'FAIL'}")
+    print("PASS" if ok else "FAIL")
