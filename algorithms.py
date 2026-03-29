@@ -465,6 +465,146 @@ def resetPPAFM():
 
 
 # ===================================================================
+# GRAVEPolicyBias (GRAVE + PPAF + AMAF bias from root)
+# ===================================================================
+
+def playoutBias(board, policy, troot):
+    """Gibbs-sampling playout biased by both policy weights and AMAF stats from root.
+    Returns (score, history for adapt, move codes for AMAF update)."""
+    history = []
+    amaf_codes = []
+    while board.pass_count < 2:
+        moves = board.legalMoves()
+        if not moves:
+            board.play(None)
+            continue
+        color = board.turn
+        codes = []
+        weights = []
+        for m in moves:
+            c = (color - 1) * 64 + m[0] * 8 + m[1]
+            codes.append(c)
+            w = policy.get(c, 0.0)
+            # Add AMAF bias from root
+            if troot is not None and troot[3][c] > 0:
+                amaf_val = troot[4][c] / troot[3][c]
+                if color == WHITE:
+                    amaf_val = 1.0 - amaf_val
+                w += amaf_val
+            weights.append(w)
+        # Gibbs sampling
+        max_w = max(weights)
+        exp_w = [math.exp(w - max_w) for w in weights]
+        total = sum(exp_w)
+        probs = [e / total for e in exp_w]
+        r = random.random()
+        cumul = 0.0
+        chosen = 0
+        for i in range(len(probs)):
+            cumul += probs[i]
+            if cumul >= r:
+                chosen = i
+                break
+        history.append((codes[chosen], color, codes, probs))
+        amaf_codes.append(codes[chosen])
+        board.play(moves[chosen])
+    return board.score(), history, amaf_codes
+
+
+def GRAVEPolicyBias_rec(board, tref, policy, troot):
+    """Recursive GRAVE with PPAF playout policy and AMAF root bias.
+    Returns (score, amaf_codes)."""
+    if board.terminal():
+        return board.score(), []
+
+    t = transposition.look(board)
+    if t is not None:
+        moves = board.legalMoves()
+        if not moves:
+            board.play(None)
+            return GRAVEPolicyBias_rec(board, tref, policy, troot)
+
+        # Update tref if this node has enough playouts
+        if t[0] > GRAVE_THRESHOLD:
+            tref = t
+
+        # Select best child (GRAVE selection)
+        bestValue = -1e9
+        bestIndex = 0
+        for i in range(len(moves)):
+            if t[1][i] == 0:
+                bestIndex = i
+                bestValue = 1e9
+                break
+            exploit = t[2][i] / t[1][i]
+            if board.turn == WHITE:
+                exploit = 1.0 - exploit
+            explore = C * math.sqrt(math.log(t[0]) / t[1][i])
+            value = exploit + explore
+            if tref is not None:
+                code = move_code(moves[i], board.turn)
+                if tref[3][code] > 0:
+                    amaf = tref[4][code] / tref[3][code]
+                    if board.turn == WHITE:
+                        amaf = 1.0 - amaf
+                    beta = tref[3][code] / (tref[3][code] + t[1][i] + BIAS * tref[3][code] * t[1][i])
+                    value = (1.0 - beta) * (exploit + explore) + beta * amaf
+            if value > bestValue:
+                bestValue = value
+                bestIndex = i
+
+        board.play(moves[bestIndex])
+        res, played = GRAVEPolicyBias_rec(board, tref, policy, troot)
+
+        # Update stats
+        t[0] += 1
+        t[1][bestIndex] += 1
+        t[2][bestIndex] += res
+
+        # Update AMAF
+        for code in played:
+            t[3][code] += 1
+            t[4][code] += res
+
+        return res, played
+    else:
+        moves = board.legalMoves()
+        if not moves:
+            board.play(None)
+            return GRAVEPolicyBias_rec(board, tref, policy, troot)
+        transposition.addAMAF(board)
+        # Use biased playout
+        res, history, amaf_codes = playoutBias(board, policy, troot)
+        adaptPolicy(policy, history, res)
+        return res, amaf_codes
+
+
+def BestMoveGRAVEPolicyBias(board, n):
+    """GRAVE + PPAF policy + AMAF root bias."""
+    transposition.Table.clear()
+    policy = {}
+    for _ in range(n):
+        b = board.copy()
+        troot = transposition.look(board)
+        GRAVEPolicyBias_rec(b, None, policy, troot)
+
+    t = transposition.look(board)
+    if t is None:
+        return None
+    moves = board.legalMoves()
+    if not moves:
+        return None
+
+    bestIndex = 0
+    bestCount = -1
+    for i in range(len(moves)):
+        if t[1][i] > bestCount:
+            bestCount = t[1][i]
+            bestIndex = i
+    return moves[bestIndex]
+
+
+# ===================================================================
 # Match runner
 # ===================================================================
 
@@ -518,5 +658,5 @@ def run_match(algo1_name, algo1_fn, algo2_name, algo2_fn, n_games=20, n_playouts
 
 
 if __name__ == '__main__':
-    run_match("PPAF", BestMovePPAF, "UCT", BestMoveUCT)
-    run_match("PPAFM", BestMovePPAFM, "PPAF", BestMovePPAF)
+    run_match("GRAVEPolicyBias", BestMoveGRAVEPolicyBias, "GRAVE", BestMoveGRAVE)
+    run_match("GRAVEPolicyBias", BestMoveGRAVEPolicyBias, "PPAFM", BestMovePPAFM)
