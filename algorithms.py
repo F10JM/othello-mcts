@@ -7,6 +7,7 @@ import transposition
 C = 0.4  # UCB/UCT exploration constant
 BIAS = 1e-5  # RAVE bias
 GRAVE_THRESHOLD = 50  # min playouts for GRAVE ref node
+ALPHA = 0.32  # PPAF adaptation rate
 
 
 # ===================================================================
@@ -300,7 +301,171 @@ def BestMoveGRAVE(board, n):
 
 
 # ===================================================================
-# Test: UCT vs Flat MC
+# PPAF (Playout Policy Adaptation with Features)
+# ===================================================================
+
+def playoutPPAF(board, policy):
+    """Gibbs-sampling playout using policy weights.
+    Returns (score, list of (chosen_code, color, all_codes, all_probs))."""
+    history = []
+    while board.pass_count < 2:
+        moves = board.legalMoves()
+        if not moves:
+            board.play(None)
+            continue
+        color = board.turn
+        # Gibbs sampling: probability proportional to exp(weight)
+        codes = []
+        weights = []
+        for m in moves:
+            c = (color - 1) * 64 + m[0] * 8 + m[1]
+            codes.append(c)
+            weights.append(policy.get(c, 0.0))
+        # Numerical stability: subtract max
+        max_w = max(weights)
+        exp_w = [math.exp(w - max_w) for w in weights]
+        total = sum(exp_w)
+        probs = [e / total for e in exp_w]
+        # Sample
+        r = random.random()
+        cumul = 0.0
+        chosen = 0
+        for i in range(len(probs)):
+            cumul += probs[i]
+            if cumul >= r:
+                chosen = i
+                break
+        history.append((codes[chosen], color, codes, probs))
+        board.play(moves[chosen])
+    return board.score(), history
+
+
+def adaptPolicy(policy, history, score):
+    """Adapt policy after playout.
+    For winner's moves: w += alpha, then subtract alpha*prob for all legal."""
+    if score == 0.5:
+        return
+    winner = BLACK if score == 1.0 else WHITE
+    for chosen_code, color, codes, probs in history:
+        if color == winner:
+            # Increase chosen move
+            policy[chosen_code] = policy.get(chosen_code, 0.0) + ALPHA
+            # Decrease all legal moves proportionally
+            for j in range(len(codes)):
+                policy[codes[j]] = policy.get(codes[j], 0.0) - ALPHA * probs[j]
+
+
+def PPAF_UCT(board, policy):
+    """UCT tree search with PPAF playout policy. Returns score from Black's perspective."""
+    if board.terminal():
+        return board.score()
+
+    t = transposition.look(board)
+    if t is not None:
+        moves = board.legalMoves()
+        if not moves:
+            board.play(None)
+            return PPAF_UCT(board, policy)
+
+        # Select best child via UCB
+        bestValue = -1e9
+        bestIndex = 0
+        for i in range(len(moves)):
+            if t[1][i] == 0:
+                bestIndex = i
+                bestValue = 1e9
+                break
+            exploit = t[2][i] / t[1][i]
+            if board.turn == WHITE:
+                exploit = 1.0 - exploit
+            explore = C * math.sqrt(math.log(t[0]) / t[1][i])
+            value = exploit + explore
+            if value > bestValue:
+                bestValue = value
+                bestIndex = i
+
+        board.play(moves[bestIndex])
+        res = PPAF_UCT(board, policy)
+
+        t[0] += 1
+        t[1][bestIndex] += 1
+        t[2][bestIndex] += res
+        return res
+    else:
+        moves = board.legalMoves()
+        if not moves:
+            board.play(None)
+            return PPAF_UCT(board, policy)
+        transposition.add(board)
+        res, history = playoutPPAF(board, policy)
+        adaptPolicy(policy, history, res)
+        return res
+
+
+def BestMovePPAF(board, n):
+    """Run n PPAF iterations, return most visited move."""
+    transposition.Table.clear()
+    policy = {}
+    for _ in range(n):
+        b = board.copy()
+        PPAF_UCT(b, policy)
+
+    t = transposition.look(board)
+    if t is None:
+        return None
+    moves = board.legalMoves()
+    if not moves:
+        return None
+
+    bestIndex = 0
+    bestCount = -1
+    for i in range(len(moves)):
+        if t[1][i] > bestCount:
+            bestCount = t[1][i]
+            bestIndex = i
+    return moves[bestIndex]
+
+
+# ===================================================================
+# PPAFM (PPAF with Memorization)
+# ===================================================================
+
+# Global persistent policy for PPAFM (survives between moves)
+_ppafm_policy = {}
+
+
+def BestMovePPAFM(board, n):
+    """PPAF with memorized policy — keeps policy from previous moves."""
+    global _ppafm_policy
+    transposition.Table.clear()
+    for _ in range(n):
+        b = board.copy()
+        PPAF_UCT(b, _ppafm_policy)
+
+    t = transposition.look(board)
+    if t is None:
+        return None
+    moves = board.legalMoves()
+    if not moves:
+        return None
+
+    bestIndex = 0
+    bestCount = -1
+    for i in range(len(moves)):
+        if t[1][i] > bestCount:
+            bestCount = t[1][i]
+            bestIndex = i
+    return moves[bestIndex]
+
+
+def resetPPAFM():
+    """Reset PPAFM policy (call at start of each game)."""
+    global _ppafm_policy
+    _ppafm_policy = {}
+
+
+# ===================================================================
+# Match runner
 # ===================================================================
 
 def run_match(algo1_name, algo1_fn, algo2_name, algo2_fn, n_games=20, n_playouts=200):
@@ -314,6 +479,7 @@ def run_match(algo1_name, algo1_fn, algo2_name, algo2_fn, n_games=20, n_playouts
     for game in range(n_games):
         board = Board()
         a1_is_black = (game % 2 == 0)
+        resetPPAFM()  # reset memorized policy each game
 
         while not board.terminal():
             moves = board.legalMoves()
@@ -352,5 +518,5 @@ def run_match(algo1_name, algo1_fn, algo2_name, algo2_fn, n_games=20, n_playouts
 
 
 if __name__ == '__main__':
-    run_match("RAVE", BestMoveRAVE, "UCT", BestMoveUCT)
-    run_match("GRAVE", BestMoveGRAVE, "RAVE", BestMoveRAVE)
+    run_match("PPAF", BestMovePPAF, "UCT", BestMoveUCT)
+    run_match("PPAFM", BestMovePPAFM, "PPAF", BestMovePPAF)
