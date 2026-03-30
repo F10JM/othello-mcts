@@ -7,7 +7,7 @@ from algorithms import (
     BestMovePPAF, BestMovePPAFM, BestMoveGRAVEPolicyBias,
 )
 
-# Match definitions (matches 1-9 from CLAUDE.md)
+# Match definitions (matches 1-9)
 MATCHES = [
     (1,  "UCT",             BestMoveUCT,             "FlatMC",          BestMoveFlatMC),
     (2,  "RAVE",            BestMoveRAVE,            "UCT",             BestMoveUCT),
